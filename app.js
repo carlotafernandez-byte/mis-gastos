@@ -15,6 +15,7 @@ const DEFAULT_STATE = {
   pending: [],    // pagos detectados pendientes de apuntar {amount, merchant, ts}
   monthStart: {}, // 'YYYY-MM' -> {income, leftover, ts}  (cierre del día 1)
   lastCheck: 0,
+  lastClip: '',
   notified: {},
 };
 
@@ -606,14 +607,17 @@ function renderStores() {
 /* ---------------- AJUSTES ---------------- */
 function detectionHelp() {
   const url = appURL();
+  const standalone = navigator.standalone === true || matchMedia('(display-mode: standalone)').matches;
   const ios = `<h3>iPhone (Apple Pay)</h3>
+    ${platform() === 'ios' && !standalone ? '<div class="card alert-warn" style="margin:8px 0"><div class="muted">Ahora la estás usando en Safari. Añádela a la pantalla de inicio (Compartir → Añadir a pantalla de inicio) y ábrela siempre desde ese icono.</div></div>' : ''}
     <ol class="steps">
-      <li>Abre <b>Atajos</b> → <b>Automatización</b> → <b>+</b> → <b>Transacción</b>.</li>
-      <li>Elige tus tarjetas, marca <b>Ejecutar inmediatamente</b> y pulsa Siguiente.</li>
-      <li>Añade la acción <b>Abrir URL</b> con esta dirección, insertando las variables <b>Importe</b> y <b>Comercio</b> donde pone [ ]:<code class="url">${esc(url)}?pago=[Importe]&comercio=[Comercio]</code></li>
-      <li>Cada vez que pagues con Apple Pay se abrirá la app con el pago y <b>no podrás seguir hasta apuntarlo</b>.</li>
+      <li>Abre <b>Atajos</b> → <b>Automatización</b> → <b>+</b> → <b>Transacción</b>. Elige tus tarjetas, marca <b>Ejecutar inmediatamente</b> y pulsa Siguiente → <b>Nueva automatización en blanco</b>.</li>
+      <li>Añade la acción <b>Texto</b> y escribe esto, insertando las variables <b>Importe</b> y <b>Comercio</b> donde pone [ ]:<code class="url">MISGASTOS|[Importe]|[Comercio]</code></li>
+      <li>Añade la acción <b>Copiar al portapapeles</b>.</li>
+      <li>Añade la acción <b>Mostrar notificación</b> con el texto: <code class="url">Pago de [Importe] en [Comercio]. Abre Mis Gastos para apuntarlo.</code></li>
+      <li>Cuando pagues te llegará el aviso. Abre la app desde su icono, toca <b>Pegar pago del atajo</b> y luego <b>Pegar</b> en la burbuja: tendrás que apuntarlo para continuar.</li>
     </ol>
-    <div class="muted">Usa la app desde Safari (su icono en la pantalla de inicio abre Safari) para que vea los pagos del atajo. Solo detecta pagos con Apple Pay, no con la tarjeta física.</div>`;
+    <div class="muted">Solo detecta pagos con Apple Pay, no con la tarjeta física. Para los demás, al abrir la app siempre te pregunta si has pagado algo.</div>`;
   const android = `<h3>Android</h3>
     <ol class="steps">
       <li>Activa en la app de tu banco las <b>notificaciones de cada pago</b>.</li>
@@ -650,7 +654,7 @@ function renderSettings() {
 
   <h2 class="section">Detección de pagos</h2>
   <div class="card flat">
-    <label class="toggle"><span>Preguntarme si he pagado algo<small>Al abrir la app, si hace más de ${s.checkHours} h que no apuntas nada, te obliga a responder.</small></span><input type="checkbox" id="force-check" ${s.forceCheck ? 'checked' : ''}></label>
+    <label class="toggle"><span>Preguntarme si he pagado algo<small>${platform() === 'ios' ? 'En iPhone te pregunta cada vez que abres la app.' : `Al abrir la app, si hace más de ${s.checkHours} h que no apuntas nada, te obliga a responder.`}</small></span><input type="checkbox" id="force-check" ${s.forceCheck ? 'checked' : ''}></label>
     <div style="margin-top:8px">${detectionHelp()}</div>
     <button class="btn block" id="test-detect" style="margin-top:12px">Probar: simular un pago detectado</button>
   </div>
@@ -885,21 +889,70 @@ function nextForcedStep() {
   }
   if (needsMonthStart()) return showMonthStart();
   const s = state.settings;
-  if (s.forceCheck && Date.now() - (state.lastCheck || 0) > s.checkHours * 3600000) {
-    const since = state.lastCheck ? new Date(state.lastCheck) : null;
-    const when = !since ? 'hoy' : since.toDateString() === new Date().toDateString()
-      ? 'desde las ' + since.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' })
-      : 'desde el ' + since.toLocaleDateString('es-ES', { weekday: 'long', day: 'numeric' });
-    showAlert({
-      icon: 'card', blue: true, locked: true,
-      title: `¿Has pagado algo ${when}?`,
-      body: 'Con tarjeta, Bizum, efectivo… Apúntalo ahora para que no se te escape nada.',
-      actions: [
-        { label: 'Sí, apuntar un pago', fn: () => { setTimeout(() => openAdd({ forced: 'check' }), 50); } },
-        { label: 'No, nada', fn: () => { state.lastCheck = Date.now(); save(); } },
-      ],
-    });
-  }
+  const clipMode = platform() === 'ios';
+  // En iPhone se pregunta en cada apertura (salvo si acabas de responder hace menos de 10 min)
+  const due = clipMode
+    ? freshOpen && Date.now() - (state.lastCheck || 0) > 10 * 60000
+    : s.forceCheck && Date.now() - (state.lastCheck || 0) > s.checkHours * 3600000;
+  if (due) { freshOpen = false; showPaymentPrompt(clipMode); }
+}
+
+let freshOpen = true;
+let hiddenAt = 0;
+function sinceText() {
+  const since = state.lastCheck ? new Date(state.lastCheck) : null;
+  return !since ? 'hoy' : since.toDateString() === new Date().toDateString()
+    ? 'desde las ' + since.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' })
+    : 'desde el ' + since.toLocaleDateString('es-ES', { weekday: 'long', day: 'numeric' });
+}
+function showPaymentPrompt(clipMode, msg = '') {
+  const actions = [];
+  if (clipMode) actions.push({ label: 'Pegar pago del atajo', fn: () => { pasteFromClipboard(); } });
+  actions.push({ label: clipMode ? 'Apuntar a mano' : 'Sí, apuntar un pago', cls: clipMode ? 'ghost' : 'primary', fn: () => { setTimeout(() => openAdd({ forced: 'check' }), 50); } });
+  actions.push({ label: 'No, nada', cls: 'ghost', fn: () => { state.lastCheck = Date.now(); save(); } });
+  showAlert({
+    icon: 'card', blue: true, locked: true,
+    title: `¿Has pagado algo ${sinceText()}?`,
+    body: (msg ? `<b style="color:var(--amber)">${msg}</b><br><br>` : '') +
+      (clipMode ? 'Si te ha llegado el aviso del atajo, toca <b>Pegar pago del atajo</b> y después <b>Pegar</b> en la burbuja del iPhone.' : 'Con tarjeta, Bizum, efectivo… Apúntalo ahora para que no se te escape nada.'),
+    actions,
+  });
+}
+// Texto que copia el atajo: MISGASTOS|12,50 €|Zara
+function parseClip(text) {
+  const m = String(text || '').match(/MISGASTOS\s*\|\s*([^|]+?)\s*\|\s*([^\n]*)/i);
+  if (!m) return null;
+  const amount = parseAmount(m[1]);
+  return amount > 0 ? { amount: Math.round(amount * 100) / 100, merchant: m[2].trim().slice(0, 40) } : null;
+}
+function pasteFromClipboard() {
+  // readText debe llamarse dentro del toque para que el iPhone lo permita
+  let p;
+  try { p = navigator.clipboard.readText(); } catch { p = Promise.reject(); }
+  p.then(text => {
+    const pay = parseClip(text);
+    if (!pay) { setTimeout(() => showPaymentPrompt(true, 'No hay ningún pago copiado por el atajo.'), 250); return; }
+    if (state.lastClip === text) { setTimeout(() => showPaymentPrompt(true, 'Ese pago ya lo apuntaste.'), 250); return; }
+    state.lastClip = text;
+    state.pending.push({ ...pay, ts: Date.now() });
+    save();
+    try { navigator.clipboard.writeText(''); } catch { /* da igual */ }
+    setTimeout(nextForcedStep, 250);
+  }).catch(() => setTimeout(showManualPaste, 250));
+}
+function showManualPaste() {
+  showAlert({
+    icon: 'card', blue: true, locked: true, title: 'Pega el pago aquí',
+    body: 'Mantén pulsado el recuadro y elige <b>Pegar</b>.<textarea id="clip-manual" rows="2" style="margin-top:12px"></textarea>',
+    actions: [
+      { label: 'Continuar', fn: () => {
+        const pay = parseClip($('#clip-manual').value);
+        if (!pay) { toast('No reconozco el pago copiado'); return false; }
+        state.pending.push({ ...pay, ts: Date.now() }); save();
+      } },
+      { label: 'Apuntar a mano', cls: 'ghost', fn: () => { setTimeout(() => openAdd({ forced: 'check' }), 50); } },
+    ],
+  });
 }
 
 /* ---------------- notificaciones ---------------- */
@@ -1091,7 +1144,7 @@ const STEPS = [
       <div class="card flat"><label class="toggle"><span>Preguntarme al abrir la app<small>Si llevas más de 3 h sin apuntar nada, te pregunta "¿Has pagado algo?" y no te deja seguir sin responder.</small></span><input type="checkbox" id="o-force" ${draft.settings.forceCheck ? 'checked' : ''}></label></div>
       <div class="card flat"><h3>Aviso del día 1</h3><div class="muted" style="margin-bottom:10px">Cada mes, al abrir la app el día 1, tendrás que meter la nómina y lo que te quedó del mes anterior. Añade el recordatorio al calendario para que te llegue la notificación.</div>
         <button class="btn primary block" id="ics-btn">Añadir recordatorio al calendario</button></div>
-      <div class="card flat"><h3>Aviso automático al pagar <span class="muted">(recomendado)</span></h3><div class="muted" style="margin:4px 0 8px">Una automatización de tu propio móvil abre la app justo después de pagar, con el importe ya puesto. Puedes hacerlo ahora o más tarde en Ajustes.</div>${detectionHelp()}</div>`,
+      <div class="card flat"><h3>Aviso automático al pagar <span class="muted">(recomendado)</span></h3><div class="muted" style="margin:4px 0 8px">Una automatización de tu propio móvil te avisa justo después de pagar y deja el importe listo para apuntarlo. Puedes hacerlo ahora o más tarde en Ajustes.</div>${detectionHelp()}</div>`,
     save: () => { draft.settings.forceCheck = $('#o-force').checked; },
   },
   { // 8 resumen
@@ -1295,7 +1348,8 @@ function exportData() {
 }
 
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) return;
+  if (document.hidden) { hiddenAt = Date.now(); return; }
+  if (Date.now() - hiddenAt > 90000) freshOpen = true;
   postFixed(); render(); checkEventReminders(); nextForcedStep();
 });
 
